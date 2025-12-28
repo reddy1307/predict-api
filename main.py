@@ -3,9 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta
-import pandas as pd
-from sklearn.linear_model import LinearRegression
-import numpy as np
+import random
 
 # ==================== Models ====================
 class Transaction(BaseModel):
@@ -21,6 +19,7 @@ class PredictionRequest(BaseModel):
 # ==================== FastAPI App ====================
 app = FastAPI(title="Spending Prediction API", version="1.0.0")
 
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,58 +30,63 @@ app.add_middleware(
 
 # ==================== Helpers ====================
 def parse_date(date_str: str):
+    """Parse date string safely"""
     try:
         return datetime.fromisoformat(date_str[:10])
     except:
         return datetime.now()
 
-def prepare_features(transactions: List[Transaction]):
-    df = pd.DataFrame([{
-        "day": parse_date(t.date).day,
-        "weekday": parse_date(t.date).weekday(),
-        "amount": t.amount
-    } for t in transactions])
-    return df
+def average_category_spending(transactions: List[Transaction]):
+    """Return average spending per category"""
+    category_totals = {}
+    category_counts = {}
+    for t in transactions:
+        category_totals[t.category] = category_totals.get(t.category, 0) + t.amount
+        category_counts[t.category] = category_counts.get(t.category, 0) + 1
+
+    averages = {}
+    for cat in category_totals:
+        averages[cat] = category_totals[cat] / category_counts[cat]
+    return averages
 
 # ==================== Routes ====================
 @app.get("/")
 async def root():
     return {"message": "Spending Prediction API", "status": "running"}
 
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
 @app.post("/predict")
 async def predict(request: PredictionRequest):
     if request.days < 1 or request.days > 90:
         raise HTTPException(status_code=400, detail="Days must be between 1 and 90")
 
-    df = prepare_features(request.transactions)
-
+    averages = average_category_spending(request.transactions)
     predictions = []
-    if not df.empty:
-        # Train simple linear regression
-        X = df[["day", "weekday"]]
-        y = df["amount"]
-        model = LinearRegression()
-        model.fit(X, y)
 
-        # Predict for next N days
-        last_date = max(parse_date(t.date) for t in request.transactions)
-        for i in range(1, request.days + 1):
-            future_date = last_date + timedelta(days=i)
-            X_pred = [[future_date.day, future_date.weekday()]]
-            amount = model.predict(X_pred)[0]
-            predictions.append({
-                "date": future_date.strftime("%Y-%m-%d"),
-                "amount": round(amount, 2),
-                "category": "General",
-            })
+    if not averages:
+        # No transactions, fallback
+        predictions.append({
+            "category": "General",
+            "amount": 500.0,
+            "note": "No transaction history, using default"
+        })
     else:
-        # Fallback if no transactions
-        for i in range(1, request.days + 1):
-            future_date = datetime.now() + timedelta(days=i)
+        for cat, avg in averages.items():
             predictions.append({
-                "date": future_date.strftime("%Y-%m-%d"),
-                "amount": 500.0,
-                "category": "General",
+                "category": cat,
+                "amount": round(avg * (request.days / 7), 2),  # scale by period
             })
 
-    return {"predictions": predictions, "days": request.days, "transaction_count": len(request.transactions)}
+    return {
+        "predictions": predictions,
+        "days": request.days,
+        "transaction_count": len(request.transactions)
+    }
+
+# For local testing
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
