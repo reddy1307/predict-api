@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta
 import random
+import json
 
 # ==================== Models ====================
 class Transaction(BaseModel):
@@ -47,53 +48,23 @@ app.add_middleware(
 def parse_date(date_str: str) -> datetime:
     """Parse date string"""
     try:
-        if 'T' in date_str:
-            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-        return datetime.strptime(date_str[:10], '%Y-%m-%d')
+        # Try different date formats
+        formats = [
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d"
+        ]
+        
+        for fmt in formats:
+            try:
+                return datetime.strptime(date_str, fmt)
+            except:
+                continue
+        
+        return datetime.now()
     except:
         return datetime.now()
-
-def calculate_average(transactions: List[Transaction]) -> float:
-    """Calculate average transaction amount"""
-    if not transactions:
-        return 500.0  # Default average
-    total = sum(t.amount for t in transactions)
-    return total / len(transactions)
-
-def get_most_common_category(transactions: List[Transaction]) -> str:
-    """Get most common category from transactions"""
-    if not transactions:
-        return "Food"
-    
-    category_counts = {}
-    for t in transactions:
-        category_counts[t.category] = category_counts.get(t.category, 0) + 1
-    
-    return max(category_counts, key=category_counts.get)
-
-def predict_amount(day_of_week: int, avg_amount: float, is_month_start: bool) -> float:
-    """Predict amount based on day patterns"""
-    base = avg_amount
-    
-    # Adjust for day of week
-    if day_of_week >= 5:  # Weekend
-        base *= 1.4
-    elif day_of_week == 0:  # Monday
-        base *= 0.8
-    elif day_of_week == 4:  # Friday
-        base *= 1.2
-    
-    # Adjust for month start (bills, shopping)
-    if is_month_start:
-        base *= 1.5
-    
-    # Add some randomness (±30%)
-    variation = 0.7 + (random.random() * 0.6)
-    return base * variation
-
-def calculate_confidence(transaction_count: int) -> float:
-    """Calculate confidence based on data quantity"""
-    return min(0.3 + (transaction_count / 30), 0.9)
 
 # ==================== Routes ====================
 @app.get("/")
@@ -115,18 +86,28 @@ def health():
         "timestamp": datetime.now().isoformat()
     }
 
-@app.post("/predict", response_model=PredictionResponse)
+@app.post("/predict")
 async def predict(request: PredictionRequest):
     try:
-        # Validate
+        # Validate days
         if request.days < 1 or request.days > 90:
-            raise HTTPException(400, "Days must be between 1 and 90")
+            raise HTTPException(status_code=400, detail="Days must be between 1 and 90")
+        
+        print(f"📊 Received request: {len(request.transactions)} transactions, {request.days} days")
         
         # Calculate average amount
-        avg_amount = calculate_average(request.transactions)
-        common_category = get_most_common_category(request.transactions)
+        avg_amount = 500.0  # Default
+        if request.transactions:
+            total = sum(t.amount for t in request.transactions)
+            avg_amount = total / len(request.transactions)
         
-        # Get last date for prediction start
+        # Find most common category
+        common_category = "Food"
+        if request.transactions:
+            categories = [t.category for t in request.transactions]
+            common_category = max(set(categories), key=categories.count)
+        
+        # Get last date or use today
         last_date = datetime.now()
         if request.transactions:
             dates = [parse_date(t.date) for t in request.transactions]
@@ -137,38 +118,79 @@ async def predict(request: PredictionRequest):
         for i in range(1, request.days + 1):
             future_date = last_date + timedelta(days=i)
             day_of_week = future_date.weekday()
-            is_month_start = future_date.day <= 7
             
-            # Predict amount
-            amount = predict_amount(day_of_week, avg_amount, is_month_start)
+            # Base prediction logic
+            amount = avg_amount
             
-            # Ensure minimum amount
+            # Adjust for day patterns
+            if day_of_week >= 5:  # Weekend
+                amount *= 1.3
+            elif day_of_week == 0:  # Monday
+                amount *= 0.9
+            elif day_of_week == 4:  # Friday
+                amount *= 1.2
+            
+            # Adjust for month start
+            if future_date.day <= 7:
+                amount *= 1.5
+            
+            # Add randomness
+            amount *= (0.8 + random.random() * 0.4)
+            
+            # Ensure minimum
             amount = max(10.0, amount)
             
-            # Determine category
-            category = common_category
-            
             # Calculate confidence
-            confidence = calculate_confidence(len(request.transactions))
+            confidence = 0.5
+            if request.transactions:
+                confidence = min(0.3 + (len(request.transactions) / 30), 0.9)
             
-            predictions.append(PredictionItem(
-                date=future_date.isoformat(),
-                amount=round(amount, 2),
-                category=category,
-                confidence=round(confidence, 2)
-            ))
+            predictions.append({
+                "date": future_date.isoformat(),
+                "amount": round(amount, 2),
+                "category": common_category,
+                "confidence": round(confidence, 2)
+            })
         
-        return PredictionResponse(
-            predictions=predictions,
-            days=request.days,
-            transaction_count=len(request.transactions),
-            model_used="SmartPredictor"
-        )
+        # Build response
+        response = {
+            "predictions": predictions,
+            "days": request.days,
+            "transaction_count": len(request.transactions),
+            "model_used": "SmartPredictor"
+        }
+        
+        return response
         
     except Exception as e:
-        raise HTTPException(500, f"Error: {str(e)}")
+        print(f"❌ Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
-# For Render deployment
+# ==================== Test Endpoint ====================
+@app.get("/test")
+def test_endpoint():
+    """Test endpoint to verify API is working"""
+    test_transactions = [
+        Transaction(date="2024-01-01", amount=500.0, category="Food"),
+        Transaction(date="2024-01-02", amount=1500.0, category="Shopping")
+    ]
+    
+    test_request = PredictionRequest(
+        transactions=test_transactions,
+        days=3
+    )
+    
+    # Call predict function directly
+    import asyncio
+    response = asyncio.run(predict(test_request))
+    
+    return {
+        "test_request": test_request.dict(),
+        "test_response": response
+    }
+
+# For local development
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print("🚀 Starting Spending Prediction API...")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
