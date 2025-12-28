@@ -1,11 +1,14 @@
-# main.py - Category-wise Spending Prediction with XGBoost
+# main.py - Spending Prediction API with XGBoost
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-from datetime import datetime, timedelta
-import numpy as np
+from datetime import datetime
 import xgboost as xgb
+import numpy as np
+import pandas as pd
+import os
+import json
 
 # ==================== Models ====================
 class Transaction(BaseModel):
@@ -19,16 +22,15 @@ class PredictionRequest(BaseModel):
     user_id: Optional[str] = None
 
 class PredictionItem(BaseModel):
+    date: str
+    amount: float
     category: str
-    predicted_amount: float
-    daily_average: float
-    confidence: float
-    model: str
+    confidence: float = 0.5
 
 # ==================== FastAPI App ====================
 app = FastAPI(
-    title="Spending Prediction API - XGBoost",
-    version="1.1.0"
+    title="Spending Prediction API",
+    version="1.0.0"
 )
 
 # Enable CORS
@@ -42,6 +44,7 @@ app.add_middleware(
 
 # ==================== Helper Functions ====================
 def parse_date(date_str: str) -> datetime:
+    """Parse date string"""
     try:
         if 'T' in date_str:
             return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
@@ -49,30 +52,24 @@ def parse_date(date_str: str) -> datetime:
     except:
         return datetime.now()
 
-def predict_category_xgb(txns: List[dict], future_days: int):
-    """Predict total spending for a category using XGBoost"""
-    if not txns:
-        return 0.0, 0.0
+def encode_category(category: str) -> int:
+    """Simple category encoding"""
+    mapping = {"Food": 0, "Transport": 1, "Shopping": 2, "Bills": 3, "Other": 4}
+    return mapping.get(category, 4)
 
-    txns = sorted(txns, key=lambda x: x["date"])
-    X = np.array(range(len(txns))).reshape(-1, 1)  # Day index
-    y = np.array([t["amount"] for t in txns])
+# ==================== Load or Train Model ====================
+MODEL_PATH = "xgb_model.json"
 
-    model = xgb.XGBRegressor(
-        n_estimators=100,
-        max_depth=3,
-        learning_rate=0.1,
-        objective='reg:squarederror'
-    )
-    model.fit(X, y)
-
-    future_X = np.array(range(len(txns), len(txns) + future_days)).reshape(-1, 1)
-    preds = model.predict(future_X)
-    preds = np.clip(preds, 0, None)
-
-    total_pred = float(np.sum(preds))
-    daily_avg = total_pred / future_days
-    return total_pred, daily_avg
+if os.path.exists(MODEL_PATH):
+    xgb_model = xgb.XGBRegressor()
+    xgb_model.load_model(MODEL_PATH)
+else:
+    # Train a dummy model if no model exists
+    X_dummy = np.array([[0,0],[1,1],[2,2],[3,3],[4,4]])
+    y_dummy = np.array([100,200,150,300,250])
+    xgb_model = xgb.XGBRegressor()
+    xgb_model.fit(X_dummy, y_dummy)
+    xgb_model.save_model(MODEL_PATH)
 
 # ==================== Routes ====================
 @app.get("/")
@@ -85,39 +82,39 @@ async def health():
 
 @app.post("/predict")
 async def predict(request: PredictionRequest):
-    if request.days not in [7, 14, 30, 90]:
-        raise HTTPException(status_code=400, detail="Days must be 7, 14, 30, or 90")
-    if not request.transactions:
-        raise HTTPException(status_code=400, detail="No transactions provided")
+    try:
+        if request.days < 1 or request.days > 90:
+            raise HTTPException(status_code=400, detail="Days must be between 1 and 90")
 
-    # Group transactions by category
-    categories = {}
-    for t in request.transactions:
-        date_obj = parse_date(t.date)
-        categories.setdefault(t.category, []).append({
-            "date": date_obj,
+        # Aggregate transactions by category
+        df = pd.DataFrame([{
+            "days_since_start": (parse_date(t.date) - parse_date(request.transactions[0].date)).days,
+            "category_encoded": encode_category(t.category),
             "amount": t.amount
-        })
+        } for t in request.transactions])
 
-    predictions = []
-    for cat, txns in categories.items():
-        total_pred, daily_avg = predict_category_xgb(txns, request.days)
-        confidence = min(0.5 + (len(txns)/40), 0.95)  # More transactions → higher confidence
+        predictions = []
+        last_date = max(df["days_since_start"]) if not df.empty else 0
 
-        predictions.append({
-            "category": cat,
-            "predicted_amount": round(total_pred, 2),
-            "daily_average": round(daily_avg, 2),
-            "confidence": round(confidence, 2),
-            "model": "XGBoost"
-        })
+        for i in range(1, request.days + 1):
+            day_future = last_date + i
+            # Predict spending amount per category
+            pred_amounts = []
+            for cat in df["category_encoded"].unique():
+                X_test = np.array([[day_future, cat]])
+                pred = xgb_model.predict(X_test)[0]
+                pred_amounts.append({
+                    "date": (parse_date(request.transactions[0].date) + pd.Timedelta(days=day_future)).strftime("%Y-%m-%d"),
+                    "amount": round(float(pred), 2),
+                    "category": list(df[df["category_encoded"]==cat]["category_encoded"].index)[0],
+                    "confidence": 0.7
+                })
+            predictions.extend(pred_amounts)
 
-    return {
-        "days": request.days,
-        "categories_count": len(predictions),
-        "predictions": predictions,
-        "model_used": "CategoryWiseXGBoost"
-    }
+        return {"predictions": predictions, "days": request.days, "transaction_count": len(request.transactions)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # For local testing
 if __name__ == "__main__":
